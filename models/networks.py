@@ -3,7 +3,9 @@ import torch.nn as nn
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
+import torch.nn.functional as F
 
+import numpy as np
 
 ###############################################################################
 # Helper Functions
@@ -198,6 +200,8 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
         net = NLayerDiscriminator(input_nc, ndf, n_layers_D, norm_layer=norm_layer)
     elif netD == 'pixel':     # classify if each pixel is real or fake
         net = PixelDiscriminator(input_nc, ndf, norm_layer=norm_layer)
+    elif netD == 'fd':
+        net = FlawDetector(in_channels=input_nc)
     else:
         raise NotImplementedError('Discriminator model name [%s] is not recognized' % netD)
     return init_net(net, init_type, init_gain, gpu_ids)
@@ -206,6 +210,111 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
 ##############################################################################
 # Classes
 ##############################################################################
+
+
+
+# ---------------------------------------------------------------------------
+# Criterion for Flaw Detector
+# ---------------------------------------------------------------------------
+class AbsoluteCriterion(nn.Module):
+    """ Absolute loss function.
+
+    The formula is:
+        loss = sqrt((pred - x)^2 + 1e-6)
+    """
+
+    def __init__(self):
+        super(AbsoluteCriterion, self).__init__()
+
+    def forward(self, pred, gt):
+        assert not gt.requires_grad
+        if not len(pred.shape) == len(gt.shape) == 4:
+            log_err('AbsoluteCriterion reaqires 4-dims tensor as inputs, '
+                    'however it gets {0}-dims (pred) and {1}-dims (gt)\n'
+                    .format(len(pred.shape), len(gt.shape)))
+
+        loss = torch.sqrt((pred - gt) ** 2 + 1e-6)
+        return loss
+
+
+class GradientCriterion(nn.Module):
+    """ Gradient loss function.
+
+    This gradient loss function only handle x and y directions.
+    The formula is:
+        loss = ( (pred_grad_x^2 + pred_grad_y^2 + 1e-6) - (gt_grad_x^2 + gt_grad_y^2 + 1e-6) )
+    """
+    
+    def __init__(self):
+        super(GradientCriterion, self).__init__()
+
+        x_kernel = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]]) / 8
+        self.conv_x = nn.Conv2d(1, 1, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv_x.weight.data = torch.tensor(x_kernel).unsqueeze(0).unsqueeze(0).float().cuda()
+        self.conv_x.weight.requires_grad = False
+
+        y_kernel = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]) / 8
+        self.conv_y = nn.Conv2d(1, 1, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv_y.weight.data = torch.tensor(y_kernel).unsqueeze(0).unsqueeze(0).float().cuda()
+        self.conv_y.weight.requires_grad = False
+
+    def forward(self, pred, gt):
+        assert not gt.requires_grad
+        if not len(pred.shape) == len(gt.shape) == 4:
+            log_err('GradientCriterion reaqires 4-dims tensor as inputs, '
+                    'however it gets {0}-dims (pred) and {1}-dims (gt)\n'
+                    .format(len(pred.shape), len(gt.shape)))
+
+        pred_grad_x, pred_grad_y = self.conv_x(pred), self.conv_y(pred)
+        pred_grad = torch.sqrt(pred_grad_x ** 2 + pred_grad_y ** 2 + 1e-6)
+
+        gt_grad_x, gt_grad_y = self.conv_x(gt), self.conv_y(gt)
+        gt_grad = torch.sqrt(gt_grad_x ** 2 + gt_grad_y ** 2 + 1e-6)
+
+        loss = torch.abs(pred_grad - gt_grad)
+        return loss
+
+
+class FlawDetectorCriterion(nn.Module):
+    def __init__(self):
+        super(FlawDetectorCriterion, self).__init__()
+        self.abs_criterion = AbsoluteCriterion()
+        self.grad_criterion = GradientCriterion()
+
+    def forward(self, pred, gt):
+        abs_loss = self.abs_criterion.forward(pred, gt)
+        grad_loss = 10.0 * self.grad_criterion.forward(pred, gt)
+        detect_loss = abs_loss + grad_loss
+
+        return torch.mean(detect_loss)
+
+    def __call__(self, pred, gt):
+        return self.forward(pred, gt)
+
+
+class MinimumFDLoss(nn.Module):
+    def __init__(self):
+        super(MinimumFDLoss, self).__init__()
+
+    def forward(self, dmap):
+        # loss = torch.mean(check_map)
+        # loss = torch.sqrt(((predicted_map + handled_map) - (handled_map * 0)) ** 2 + self.epsilon)
+        # loss = torch.sqrt((predicted_map)**2 + self.epsilon)
+
+        # loss = torch.mean(check_map)
+        loss = torch.sum(dmap)
+        return loss
+
+        # loss = torch.log(torch.mean(predicted_map) + 1)
+        # scale = torch.log(torch.mean(handled_map) + 1).data / torch.log(torch.mean(predicted_map) + 1).data
+        # loss = loss * scale
+        # return loss
+
+    def __call__(self, dmap):
+        return self.forward(dmap)
+
+# ---------------------------------------------------------------------------
+
 class GANLoss(nn.Module):
     """Define different GAN objectives.
 
@@ -613,3 +722,95 @@ class PixelDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.net(input)
+
+
+class FlawDetector(nn.Module):
+    def __init__(self, in_channels):
+        super(FlawDetector, self).__init__()
+
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, 8, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+        )
+        self.enc2 = EncoderBlock(8, 32, stride=2)
+        self.enc3 = EncoderBlock(32, 64, stride=2)
+        self.enc4 = EncoderBlock(64, 128, stride=2)
+
+        self.dec1 = DecoderBlock(128 + 64, 64)
+        self.dec2 = DecoderBlock(64 + 32, 32)
+        self.dec3 = DecoderBlock(32 + 8, 8)
+        self.final = nn.Conv2d(8, 1, 1)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                self.init_conv(m)
+            elif isinstance(m, nn.BatchNorm2d):
+                self.init_norm(m)
+
+    def forward(self, inp_D):
+
+        enc1 = self.enc1(inp_D)
+        enc2 = self.enc2(enc1)
+        enc3 = self.enc3(enc2)
+        enc4 = self.enc4(enc3)
+
+        dec1 = self.dec1(enc4, enc3)
+        dec2 = self.dec2(dec1, enc2)
+        dec3 = self.dec3(dec2, enc1)
+        final = self.final(dec3)
+
+        x = torch.sigmoid(final)
+        return x
+
+    def init_conv(self, conv):
+        nn.init.kaiming_uniform_(conv.weight, a=0, mode='fan_in', nonlinearity='relu')
+        if conv.bias is not None:
+            nn.init.constant_(conv.bias, 0)
+
+    def init_norm(self, norm):
+        if norm.weight is not None:
+            nn.init.constant_(norm.weight, 1)
+            nn.init.constant_(norm.bias, 0)
+
+
+class EncoderBlock(nn.Module):
+    def __init__(self, in_channel, out_channel, stride=1):
+        super(EncoderBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channel, out_channel, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(out_channel, out_channel, kernel_size=3, padding=1, bias=False)
+
+        self.bn1 = nn.BatchNorm2d(out_channel)
+        self.bn2 = nn.BatchNorm2d(out_channel)
+
+        self.relu = nn.ReLU(inplace=True)
+        self.pooling = nn.AvgPool2d(stride)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.pooling(x)
+        return x
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(DecoderBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channel, out_channel, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(out_channel, out_channel, kernel_size=3, padding=1, bias=False)
+
+        self.bn1 = nn.BatchNorm2d(out_channel)
+        self.bn2 = nn.BatchNorm2d(out_channel)
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x, y=None):
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        if y is not None:
+            x = torch.cat((x, y), 1)
+
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        return x
